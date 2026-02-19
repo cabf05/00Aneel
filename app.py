@@ -11,24 +11,23 @@ RESOURCE_ID = "11ec447d-698d-4ab8-977f-b424d5deee6a"
 BASE_URL = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search"
 
 # -------------------------------
-# FUNÇÃO PARA BAIXAR TODOS DADOS
+# Baixar todos os dados (paginação)
 # -------------------------------
 
 @st.cache_data(show_spinner=True)
-def baixar_tudo():
+def carregar_base_completa():
     limit = 1000
     offset = 0
     all_records = []
 
     while True:
-        url = BASE_URL
         params = {
             "resource_id": RESOURCE_ID,
             "limit": limit,
             "offset": offset
         }
 
-        response = requests.get(url, params=params)
+        response = requests.get(BASE_URL, params=params)
         data = response.json()
 
         if not data["success"]:
@@ -39,7 +38,6 @@ def baixar_tudo():
             break
 
         all_records.extend(records)
-
         offset += limit
         time.sleep(0.2)
 
@@ -47,13 +45,13 @@ def baixar_tudo():
     return df
 
 
-if st.button("📥 Baixar Base Completa ANEEL"):
+if st.button("📥 Carregar Base Completa da ANEEL"):
 
-    df = baixar_tudo()
+    df = carregar_base_completa()
 
-    st.success(f"{len(df)} registros carregados")
+    st.success(f"{len(df)} registros carregados da ANEEL")
 
-    # Padronização básica
+    # Padronização
     if "Potencia Outorgada (kW)" in df.columns:
         df["Potencia MW"] = pd.to_numeric(
             df["Potencia Outorgada (kW)"], errors="coerce"
@@ -66,44 +64,61 @@ if st.button("📥 Baixar Base Completa ANEEL"):
             df["Situacao"].str.contains("Operação", case=False, na=False)
         ]
 
-    st.subheader("📊 Filtros Comerciais")
+    st.subheader("🔎 Filtros e Busca")
 
-    estados = st.multiselect(
-        "Filtrar por Estado",
-        options=sorted(df["UF"].dropna().unique())
-        if "UF" in df.columns else []
-    )
+    col1, col2, col3 = st.columns(3)
 
-    pot_min = st.number_input("Potência mínima (MW)", 0.0, 10000.0, 1.0)
-    pot_max = st.number_input("Potência máxima (MW)", 0.0, 10000.0, 10.0)
+    with col1:
+        busca = st.text_input("Busca geral (empresa, usina, CNPJ...)")
 
-    if estados:
-        df = df[df["UF"].isin(estados)]
-
-    if "Potencia MW" in df.columns:
-        df = df[
-            (df["Potencia MW"] >= pot_min) &
-            (df["Potencia MW"] <= pot_max)
-        ]
-
-    st.subheader("📋 Tabela de Usinas")
-    st.dataframe(df, use_container_width=True)
-
-    if "Nome da Outorgada" in df.columns:
-        ranking = (
-            df.groupby("Nome da Outorgada")["Potencia MW"]
-            .sum()
-            .sort_values(ascending=False)
-            .reset_index()
+    with col2:
+        estados = st.multiselect(
+            "Estado (UF)",
+            sorted(df["UF"].dropna().unique())
+            if "UF" in df.columns else []
         )
 
-        st.subheader("🏆 Ranking por Empresa (MW Total)")
-        st.dataframe(ranking, use_container_width=True)
+    with col3:
+        pot_range = st.slider(
+            "Faixa de Potência (MW)",
+            0.0,
+            float(df["Potencia MW"].max()) if "Potencia MW" in df.columns else 1000.0,
+            (1.0, 10.0)
+        )
 
-    csv = df.to_csv(index=False).encode("utf-8")
+    # Aplicar filtros
+    df_filtrado = df.copy()
+
+    if busca:
+        df_filtrado = df_filtrado[
+            df_filtrado.astype(str)
+            .apply(lambda row: row.str.contains(busca, case=False).any(), axis=1)
+        ]
+
+    if estados:
+        df_filtrado = df_filtrado[df_filtrado["UF"].isin(estados)]
+
+    if "Potencia MW" in df_filtrado.columns:
+        df_filtrado = df_filtrado[
+            (df_filtrado["Potencia MW"] >= pot_range[0]) &
+            (df_filtrado["Potencia MW"] <= pot_range[1])
+        ]
+
+    st.subheader("📋 Tabela Completa")
+
+    st.dataframe(
+        df_filtrado,
+        use_container_width=True,
+        height=600
+    )
+
+    st.write(f"Total exibido: {len(df_filtrado)} usinas")
+
+    # Download
+    csv = df_filtrado.to_csv(index=False).encode("utf-8")
     st.download_button(
-        "📥 Baixar CSV",
+        "📥 Baixar CSV filtrado",
         csv,
-        "usinas_solares_aneel.csv",
+        "usinas_solares_filtradas.csv",
         "text/csv"
     )
