@@ -8,7 +8,7 @@ from st_aggrid.shared import GridUpdateMode
 
 st.set_page_config(layout="wide")
 
-st.title("☀️ Dashboard Usinas – ANEEL")
+st.title("Dashboard Dados – ANEEL")
 
 RESOURCE_ID = "11ec447d-698d-4ab8-977f-b424d5deee6a"
 BASE_URL = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search"
