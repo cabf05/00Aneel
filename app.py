@@ -13,9 +13,8 @@ st.title("⚡ Brazil Energy Intelligence Dashboard")
 RESOURCE_ID = "11ec447d-698d-4ab8-977f-b424d5deee6a"
 BASE_URL = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search"
 
-
 # =====================================================
-# CARREGAMENTO
+# CARREGAMENTO OTIMIZADO
 # =====================================================
 
 @st.cache_data(show_spinner=True)
@@ -47,17 +46,21 @@ def carregar_base():
 
     df = pd.DataFrame(all_records)
 
-    # Tratamentos
-    df["MdaPotenciaOutorgadaKw"] = (
-        df["MdaPotenciaOutorgadaKw"]
-        .astype(str)
-        .str.replace(".", "", regex=False)
-        .str.replace(",", ".", regex=False)
-    )
+    # ------------------------
+    # Tratamentos importantes
+    # ------------------------
 
-    df["Potencia MW"] = pd.to_numeric(
-        df["MdaPotenciaOutorgadaKw"], errors="coerce"
-    ) / 1000
+    if "MdaPotenciaOutorgadaKw" in df.columns:
+        df["MdaPotenciaOutorgadaKw"] = (
+            df["MdaPotenciaOutorgadaKw"]
+            .astype(str)
+            .str.replace(".", "", regex=False)
+            .str.replace(",", ".", regex=False)
+        )
+
+        df["Potencia MW"] = pd.to_numeric(
+            df["MdaPotenciaOutorgadaKw"], errors="coerce"
+        ) / 1000
 
     df["Lat"] = pd.to_numeric(
         df["NumCoordNEmpreendimento"].astype(str).str.replace(",", "."),
@@ -69,6 +72,7 @@ def carregar_base():
         errors="coerce"
     )
 
+    # Apenas usinas em operação
     df = df[df["DscFaseUsina"] == "Operação"]
 
     return df.reset_index(drop=True)
@@ -77,7 +81,7 @@ def carregar_base():
 df = carregar_base()
 
 # =====================================================
-# SIDEBAR
+# SIDEBAR FILTROS
 # =====================================================
 
 st.sidebar.header("Filters")
@@ -92,6 +96,13 @@ fontes = st.sidebar.multiselect(
     sorted(df["DscOrigemCombustivel"].dropna().unique())
 )
 
+pot_min, pot_max = st.sidebar.slider(
+    "Capacity Range (MW)",
+    0.0,
+    float(df["Potencia MW"].max()),
+    (0.0, float(df["Potencia MW"].max()))
+)
+
 df_filtrado = df.copy()
 
 if ufs:
@@ -100,8 +111,13 @@ if ufs:
 if fontes:
     df_filtrado = df_filtrado[df_filtrado["DscOrigemCombustivel"].isin(fontes)]
 
+df_filtrado = df_filtrado[
+    (df_filtrado["Potencia MW"] >= pot_min) &
+    (df_filtrado["Potencia MW"] <= pot_max)
+]
+
 # =====================================================
-# MÉTRICAS
+# MÉTRICAS SUPERIORES
 # =====================================================
 
 col1, col2, col3 = st.columns(3)
@@ -113,33 +129,43 @@ col3.metric("States", df_filtrado["SigUFPrincipal"].nunique())
 st.markdown("---")
 
 # =====================================================
-# ZOOM INTELIGENTE
+# MAPA COM CLUSTER AUTOMÁTICO
 # =====================================================
 
-if not df_filtrado.empty:
-    center_lat = df_filtrado["Lat"].mean()
-    center_lon = df_filtrado["Lon"].mean()
+st.subheader("Geospatial View")
+
+map_data = df_filtrado.dropna(subset=["Lat", "Lon"])
+
+if not map_data.empty:
+
+    center_lat = map_data["Lat"].mean()
+    center_lon = map_data["Lon"].mean()
 else:
     center_lat = -14.2350
     center_lon = -51.9253
 
 zoom_level = 6 if len(ufs) == 1 else 4
 
-
-# =====================================================
-# CLUSTER AUTOMÁTICO
-# =====================================================
-
-map_data = df_filtrado.dropna(subset=["Lat", "Lon"])
-
-layer = pdk.Layer(
-    "ScatterplotLayer",
-    data=map_data,
-    get_position='[Lon, Lat]',
-    get_radius="Potencia MW * 200",
-    get_fill_color=[0, 110, 255, 180],
-    pickable=True,
-)
+# Cluster automático se muitos pontos
+if len(map_data) > 2000:
+    layer = pdk.Layer(
+        "HexagonLayer",
+        data=map_data,
+        get_position='[Lon, Lat]',
+        radius=30000,
+        elevation_scale=50,
+        pickable=True,
+        extruded=True,
+    )
+else:
+    layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=map_data,
+        get_position='[Lon, Lat]',
+        get_radius="Potencia MW * 200",
+        get_fill_color=[0, 110, 255, 180],
+        pickable=True,
+    )
 
 view_state = pdk.ViewState(
     latitude=center_lat,
@@ -159,24 +185,12 @@ deck = pdk.Deck(
     }
 )
 
-st.subheader("Geospatial View")
-event = st.pydeck_chart(deck)
-
-# =====================================================
-# CLIQUE NO PONTO → FILTRAR
-# =====================================================
-
-if event and "object" in event and event["object"]:
-    nome_usina = event["object"]["NomEmpreendimento"]
-    df_filtrado = df_filtrado[
-        df_filtrado["NomEmpreendimento"] == nome_usina
-    ]
-    st.info(f"Filtered by selected plant: {nome_usina}")
+st.pydeck_chart(deck)
 
 st.markdown("---")
 
 # =====================================================
-# TABELA RESUMIDA
+# TABELA RESUMIDA ORDENÁVEL
 # =====================================================
 
 st.subheader("Filtered Plants")
@@ -201,7 +215,7 @@ st.dataframe(
 st.markdown("---")
 
 # =====================================================
-# TABELA COMPLETA PROFISSIONAL
+# TABELA COMPLETA PREMIUM (AgGrid)
 # =====================================================
 
 st.subheader("Full Dataset")
@@ -220,6 +234,8 @@ gb.configure_pagination(
     paginationPageSize=100
 )
 
+gb.configure_selection("single", use_checkbox=True)
+
 grid_options = gb.build()
 
 AgGrid(
@@ -228,4 +244,17 @@ AgGrid(
     update_mode=GridUpdateMode.NO_UPDATE,
     theme="streamlit",
     height=600
+)
+
+# =====================================================
+# DOWNLOAD
+# =====================================================
+
+csv = df_filtrado.to_csv(index=False).encode("utf-8")
+
+st.download_button(
+    "Download Filtered CSV",
+    csv,
+    "filtered_energy_data.csv",
+    "text/csv"
 )
