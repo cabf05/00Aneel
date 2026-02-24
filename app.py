@@ -5,6 +5,8 @@ import time
 import pydeck as pdk
 from st_aggrid import AgGrid, GridOptionsBuilder
 from st_aggrid.shared import GridUpdateMode
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 st.set_page_config(layout="wide")
 
@@ -20,21 +22,38 @@ RES_GD_INFO = "b1bd71e7-d0ad-4214-9053-cbd58e9564a7"
 RES_GD_FOTO = "49fa9ca0-f609-4ae3-a6f7-b97bd0945a3a"
 
 # =====================================================
-# FUNÇÃO GENÉRICA PARA EXTRAÇÃO
+# FUNÇÃO GENÉRICA PARA EXTRAÇÃO (COM RETRIES E TIMEOUT MAIOR)
 # =====================================================
-def fetch_aneel_data(resource_id, limit_per_page=5000, max_records=20000):
+def fetch_aneel_data(resource_id, limit_per_page=1000, max_records=20000):
     """
-    Busca dados na API da ANEEL. 
-    Nota: max_records adicionado para evitar travamento, já que a base de GD tem milhões de linhas.
-    Ajuste max_records conforme a capacidade do seu servidor.
+    Busca dados na API da ANEEL com proteção contra quedas e timeouts.
     """
     offset = 0
     all_records = []
     
+    # Configurando um sistema de tentativas (Retries)
+    # Se a API falhar, ele tentará até 3 vezes novamente com um intervalo entre as tentativas
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1, # Espera 1s, depois 2s, depois 4s...
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    
+    # Criamos um placeholder no Streamlit para mostrar o progresso ao usuário
+    progresso = st.empty()
+    
     while offset < max_records:
+        progresso.text(f"Baixando dados... {offset} registros carregados de {resource_id[-5:]}")
         params = {"resource_id": resource_id, "limit": limit_per_page, "offset": offset}
+        
         try:
-            response = requests.get(BASE_URL, params=params, timeout=15)
+            # Aumentamos o timeout de 15 para 60 segundos
+            response = session.get(BASE_URL, params=params, timeout=60)
             data = response.json()
             
             if not data.get("success", False):
@@ -46,11 +65,13 @@ def fetch_aneel_data(resource_id, limit_per_page=5000, max_records=20000):
                 
             all_records.extend(records)
             offset += limit_per_page
-            time.sleep(0.05) # Evitar block da API
-        except Exception as e:
-            st.warning(f"Erro ao buscar dados: {e}")
-            break
+            time.sleep(0.1) # Respiro para não derrubar a API da ANEEL
             
+        except Exception as e:
+            st.warning(f"A API da ANEEL está instável. Paramos no registro {offset}. Erro: {e}")
+            break # Retorna o que já conseguiu baixar até dar o erro fatal
+            
+    progresso.empty() # Limpa a mensagem de progresso ao terminar
     return pd.DataFrame(all_records)
 
 # =====================================================
