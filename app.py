@@ -8,15 +8,15 @@ from st_aggrid.shared import GridUpdateMode
 
 st.set_page_config(layout="wide")
 
-st.title("Dashboard Dados – ANEEL")
+st.title("⚡ Brazil Energy Intelligence Dashboard")
 
 RESOURCE_ID = "11ec447d-698d-4ab8-977f-b424d5deee6a"
 BASE_URL = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search"
 
 
-# ==============================
-# CARREGAMENTO OTIMIZADO
-# ==============================
+# =====================================================
+# CARREGAMENTO
+# =====================================================
 
 @st.cache_data(show_spinner=True)
 def carregar_base():
@@ -47,11 +47,7 @@ def carregar_base():
 
     df = pd.DataFrame(all_records)
 
-    # ------------------------
-    # Tratamentos importantes
-    # ------------------------
-
-    # Converter potência corretamente
+    # Tratamentos
     df["MdaPotenciaOutorgadaKw"] = (
         df["MdaPotenciaOutorgadaKw"]
         .astype(str)
@@ -63,18 +59,13 @@ def carregar_base():
         df["MdaPotenciaOutorgadaKw"], errors="coerce"
     ) / 1000
 
-    # Converter coordenadas
     df["Lat"] = pd.to_numeric(
-        df["NumCoordNEmpreendimento"]
-        .astype(str)
-        .str.replace(",", ".", regex=False),
+        df["NumCoordNEmpreendimento"].astype(str).str.replace(",", "."),
         errors="coerce"
     )
 
     df["Lon"] = pd.to_numeric(
-        df["NumCoordEEmpreendimento"]
-        .astype(str)
-        .str.replace(",", ".", regex=False),
+        df["NumCoordEEmpreendimento"].astype(str).str.replace(",", "."),
         errors="coerce"
     )
 
@@ -85,27 +76,20 @@ def carregar_base():
 
 df = carregar_base()
 
-# ==============================
-# SIDEBAR FILTROS
-# ==============================
+# =====================================================
+# SIDEBAR
+# =====================================================
 
-st.sidebar.header("Filtros")
+st.sidebar.header("Filters")
 
 ufs = st.sidebar.multiselect(
-    "Estado",
+    "State (UF)",
     sorted(df["SigUFPrincipal"].dropna().unique())
 )
 
 fontes = st.sidebar.multiselect(
-    "Fonte",
+    "Energy Source",
     sorted(df["DscOrigemCombustivel"].dropna().unique())
-)
-
-pot_min, pot_max = st.sidebar.slider(
-    "Faixa Potência (MW)",
-    0.0,
-    float(df["Potencia MW"].max()),
-    (0.0, float(df["Potencia MW"].max()))
 )
 
 df_filtrado = df.copy()
@@ -116,27 +100,35 @@ if ufs:
 if fontes:
     df_filtrado = df_filtrado[df_filtrado["DscOrigemCombustivel"].isin(fontes)]
 
-df_filtrado = df_filtrado[
-    (df_filtrado["Potencia MW"] >= pot_min) &
-    (df_filtrado["Potencia MW"] <= pot_max)
-]
-
-# ==============================
+# =====================================================
 # MÉTRICAS
-# ==============================
+# =====================================================
 
 col1, col2, col3 = st.columns(3)
 
-col1.metric("Total Usinas", f"{len(df_filtrado):,}")
-col2.metric("Potência Total (MW)", f"{df_filtrado['Potencia MW'].sum():,.2f}")
-col3.metric("Estados", df_filtrado["SigUFPrincipal"].nunique())
+col1.metric("Plants", f"{len(df_filtrado):,}")
+col2.metric("Total Capacity (MW)", f"{df_filtrado['Potencia MW'].sum():,.2f}")
+col3.metric("States", df_filtrado["SigUFPrincipal"].nunique())
+
+st.markdown("---")
+
+# =====================================================
+# ZOOM INTELIGENTE
+# =====================================================
+
+if not df_filtrado.empty:
+    center_lat = df_filtrado["Lat"].mean()
+    center_lon = df_filtrado["Lon"].mean()
+else:
+    center_lat = -14.2350
+    center_lon = -51.9253
+
+zoom_level = 6 if len(ufs) == 1 else 4
 
 
-# ==============================
-# MAPA
-# ==============================
-
-st.subheader("📍 Mapa Interativo")
+# =====================================================
+# CLUSTER AUTOMÁTICO
+# =====================================================
 
 map_data = df_filtrado.dropna(subset=["Lat", "Lon"])
 
@@ -144,35 +136,50 @@ layer = pdk.Layer(
     "ScatterplotLayer",
     data=map_data,
     get_position='[Lon, Lat]',
-    get_radius=20000,
+    get_radius="Potencia MW * 200",
+    get_fill_color=[0, 110, 255, 180],
     pickable=True,
 )
 
 view_state = pdk.ViewState(
-    latitude=-14.2350,
-    longitude=-51.9253,
-    zoom=4
+    latitude=center_lat,
+    longitude=center_lon,
+    zoom=zoom_level
 )
 
 deck = pdk.Deck(
     layers=[layer],
     initial_view_state=view_state,
+    map_style=pdk.map_styles.LIGHT,
     tooltip={
         "html": "<b>{NomEmpreendimento}</b><br/>"
-                "Potência: {Potencia MW} MW<br/>"
-                "UF: {SigUFPrincipal}<br/>"
-                "Fonte: {DscOrigemCombustivel}"
+                "Capacity: {Potencia MW} MW<br/>"
+                "State: {SigUFPrincipal}<br/>"
+                "Source: {DscOrigemCombustivel}"
     }
 )
 
-st.pydeck_chart(deck)
+st.subheader("Geospatial View")
+event = st.pydeck_chart(deck)
 
+# =====================================================
+# CLIQUE NO PONTO → FILTRAR
+# =====================================================
 
-# ==============================
+if event and "object" in event and event["object"]:
+    nome_usina = event["object"]["NomEmpreendimento"]
+    df_filtrado = df_filtrado[
+        df_filtrado["NomEmpreendimento"] == nome_usina
+    ]
+    st.info(f"Filtered by selected plant: {nome_usina}")
+
+st.markdown("---")
+
+# =====================================================
 # TABELA RESUMIDA
-# ==============================
+# =====================================================
 
-st.subheader("📊 Tabela Resumida")
+st.subheader("Filtered Plants")
 
 df_resumo = df_filtrado[
     [
@@ -183,20 +190,21 @@ df_resumo = df_filtrado[
         "DscOrigemCombustivel",
         "DscPropriRegimePariticipacao"
     ]
-]
+].sort_values("Potencia MW", ascending=False)
 
 st.dataframe(
-    df_resumo.sort_values("Potencia MW", ascending=False),
+    df_resumo,
     use_container_width=True,
-    height=400
+    height=350
 )
 
+st.markdown("---")
 
-# ==============================
-# TABELA COMPLETA (AgGrid)
-# ==============================
+# =====================================================
+# TABELA COMPLETA PROFISSIONAL
+# =====================================================
 
-st.subheader("📋 Base Completa")
+st.subheader("Full Dataset")
 
 gb = GridOptionsBuilder.from_dataframe(df_filtrado)
 
@@ -218,7 +226,6 @@ AgGrid(
     df_filtrado,
     gridOptions=grid_options,
     update_mode=GridUpdateMode.NO_UPDATE,
-    fit_columns_on_grid_load=False,
     theme="streamlit",
     height=600
 )
