@@ -1,21 +1,22 @@
 import streamlit as st
-import requests
 import pandas as pd
+import requests
 import time
+import pydeck as pdk
 from st_aggrid import AgGrid, GridOptionsBuilder
 from st_aggrid.shared import GridUpdateMode
 
-st.set_page_config(page_title="ANEEL Solar Database", layout="wide")
+st.set_page_config(layout="wide")
 
-st.title("☀️ Base Completa de Usinas Solares - ANEEL")
+st.title("☀️ Dashboard Usinas – ANEEL")
 
 RESOURCE_ID = "11ec447d-698d-4ab8-977f-b424d5deee6a"
 BASE_URL = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search"
 
 
-# =====================================================
-# CARREGAMENTO COM CACHE
-# =====================================================
+# ==============================
+# CARREGAMENTO OTIMIZADO
+# ==============================
 
 @st.cache_data(show_spinner=True)
 def carregar_base():
@@ -46,62 +47,156 @@ def carregar_base():
 
     df = pd.DataFrame(all_records)
 
-    # -------------------------
-    # Padronizações importantes
-    # -------------------------
+    # ------------------------
+    # Tratamentos importantes
+    # ------------------------
 
-    if "Potencia Outorgada (kW)" in df.columns:
-        df["Potencia MW"] = (
-            pd.to_numeric(df["Potencia Outorgada (kW)"], errors="coerce") / 1000
-        )
+    # Converter potência corretamente
+    df["MdaPotenciaOutorgadaKw"] = (
+        df["MdaPotenciaOutorgadaKw"]
+        .astype(str)
+        .str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
 
-    # Filtrar Solar + Operação já no carregamento
-    if "Fonte" in df.columns and "Situacao" in df.columns:
-        df = df[
-            df["Fonte"].str.contains("Solar", case=False, na=False) &
-            df["Situacao"].str.contains("Operação", case=False, na=False)
-        ]
+    df["Potencia MW"] = pd.to_numeric(
+        df["MdaPotenciaOutorgadaKw"], errors="coerce"
+    ) / 1000
 
-    # Resetar índice para performance
-    df = df.reset_index(drop=True)
+    # Converter coordenadas
+    df["Lat"] = pd.to_numeric(
+        df["NumCoordNEmpreendimento"]
+        .astype(str)
+        .str.replace(",", ".", regex=False),
+        errors="coerce"
+    )
 
-    return df
+    df["Lon"] = pd.to_numeric(
+        df["NumCoordEEmpreendimento"]
+        .astype(str)
+        .str.replace(",", ".", regex=False),
+        errors="coerce"
+    )
 
+    df = df[df["DscFaseUsina"] == "Operação"]
 
-# =====================================================
-# CARREGAR BASE UMA VEZ
-# =====================================================
+    return df.reset_index(drop=True)
+
 
 df = carregar_base()
 
-st.success(f"{len(df):,} usinas solares em operação carregadas")
+# ==============================
+# SIDEBAR FILTROS
+# ==============================
+
+st.sidebar.header("Filtros")
+
+ufs = st.sidebar.multiselect(
+    "Estado",
+    sorted(df["SigUFPrincipal"].dropna().unique())
+)
+
+fontes = st.sidebar.multiselect(
+    "Fonte",
+    sorted(df["DscOrigemCombustivel"].dropna().unique())
+)
+
+pot_min, pot_max = st.sidebar.slider(
+    "Faixa Potência (MW)",
+    0.0,
+    float(df["Potencia MW"].max()),
+    (0.0, float(df["Potencia MW"].max()))
+)
+
+df_filtrado = df.copy()
+
+if ufs:
+    df_filtrado = df_filtrado[df_filtrado["SigUFPrincipal"].isin(ufs)]
+
+if fontes:
+    df_filtrado = df_filtrado[df_filtrado["DscOrigemCombustivel"].isin(fontes)]
+
+df_filtrado = df_filtrado[
+    (df_filtrado["Potencia MW"] >= pot_min) &
+    (df_filtrado["Potencia MW"] <= pot_max)
+]
+
+# ==============================
+# MÉTRICAS
+# ==============================
+
+col1, col2, col3 = st.columns(3)
+
+col1.metric("Total Usinas", f"{len(df_filtrado):,}")
+col2.metric("Potência Total (MW)", f"{df_filtrado['Potencia MW'].sum():,.2f}")
+col3.metric("Estados", df_filtrado["SigUFPrincipal"].nunique())
 
 
-# =====================================================
-# BUSCA GLOBAL OTIMIZADA
-# =====================================================
+# ==============================
+# MAPA
+# ==============================
 
-st.subheader("🔎 Busca Global")
+st.subheader("📍 Mapa Interativo")
 
-busca = st.text_input("Digite qualquer termo (empresa, CNPJ, município...)")
+map_data = df_filtrado.dropna(subset=["Lat", "Lon"])
 
-df_filtrado = df
+layer = pdk.Layer(
+    "ScatterplotLayer",
+    data=map_data,
+    get_position='[Lon, Lat]',
+    get_radius=20000,
+    pickable=True,
+)
 
-if busca:
-    mask = df.astype(str).apply(
-        lambda col: col.str.contains(busca, case=False, na=False)
-    )
-    df_filtrado = df[mask.any(axis=1)]
+view_state = pdk.ViewState(
+    latitude=-14.2350,
+    longitude=-51.9253,
+    zoom=4
+)
+
+deck = pdk.Deck(
+    layers=[layer],
+    initial_view_state=view_state,
+    tooltip={
+        "html": "<b>{NomEmpreendimento}</b><br/>"
+                "Potência: {Potencia MW} MW<br/>"
+                "UF: {SigUFPrincipal}<br/>"
+                "Fonte: {DscOrigemCombustivel}"
+    }
+)
+
+st.pydeck_chart(deck)
 
 
-st.write(f"Total após filtro: {len(df_filtrado):,}")
+# ==============================
+# TABELA RESUMIDA
+# ==============================
+
+st.subheader("📊 Tabela Resumida")
+
+df_resumo = df_filtrado[
+    [
+        "NomEmpreendimento",
+        "Potencia MW",
+        "SigUFPrincipal",
+        "DscMuninicpios",
+        "DscOrigemCombustivel",
+        "DscPropriRegimePariticipacao"
+    ]
+]
+
+st.dataframe(
+    df_resumo.sort_values("Potencia MW", ascending=False),
+    use_container_width=True,
+    height=400
+)
 
 
-# =====================================================
-# AGGRID PROFISSIONAL OTIMIZADO
-# =====================================================
+# ==============================
+# TABELA COMPLETA (AgGrid)
+# ==============================
 
-st.subheader("📊 Base Completa")
+st.subheader("📋 Base Completa")
 
 gb = GridOptionsBuilder.from_dataframe(df_filtrado)
 
@@ -117,8 +212,6 @@ gb.configure_pagination(
     paginationPageSize=100
 )
 
-gb.configure_selection("multiple", use_checkbox=True)
-
 grid_options = gb.build()
 
 AgGrid(
@@ -127,21 +220,5 @@ AgGrid(
     update_mode=GridUpdateMode.NO_UPDATE,
     fit_columns_on_grid_load=False,
     theme="streamlit",
-    enable_enterprise_modules=False,
-    height=650,
-    reload_data=False
-)
-
-
-# =====================================================
-# DOWNLOAD
-# =====================================================
-
-csv = df_filtrado.to_csv(index=False).encode("utf-8")
-
-st.download_button(
-    "📥 Baixar CSV filtrado",
-    csv,
-    "usinas_solares_filtradas.csv",
-    "text/csv"
+    height=600
 )
