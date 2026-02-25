@@ -4,7 +4,7 @@ import requests
 import json
 import time
 
-st.set_page_config(layout="wide")
+st.set_page_config(layout="wide", page_title="ANEEL Data Downloader")
 
 # IDs das tabelas da ANEEL
 RECURSOS = {
@@ -15,26 +15,112 @@ RECURSOS = {
 
 BASE_URL = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search"
 
-# Função otimizada para baixar dados sem estourar a memória
-@st.cache_data(show_spinner=True)
-def baixar_dados_aneel(resource_id, filtros=None):
+# --- FUNÇÃO DE EXTRAÇÃO ---
+@st.cache_data(show_spinner=False)
+def baixar_dados_aneel(resource_id, filtros=None, label="dados"):
     all_records = []
     offset = 0
-    limit = 10000 # Blocos grandes para ser rápido
-    
-    # Criamos uma sessão para manter a conexão ativa
+    limit = 10000 
     session = requests.Session()
     
+    placeholder = st.empty()
+    
     while True:
-        params = {
-            "resource_id": resource_id,
-            "limit": limit,
-            "offset": offset
-        }
+        params = {"resource_id": resource_id, "limit": limit, "offset": offset}
         if filtros:
             params["filters"] = json.dumps(filtros)
             
         try:
+            r = session.get(BASE_URL, params=params, timeout=60)
+            data = r.json()
+            if not data.get("success", False):
+                break
+            
+            records = data["result"]["records"]
+            if not records:
+                break
+            
+            # Filtro de colunas IMEDIATO para economizar RAM
+            df_temp = pd.DataFrame(records)
+            colunas_uteis = [
+                'SigUF', 'NomTitularEmpreendimento', 'DscFonteGeracao', 
+                'MdaPotenciaInstaladaKW', 'NumCoordNEmpreendimento', 
+                'NumCoordEEmpreendimento', 'CodEmpreendimento',
+                'NomFabricanteModulo', 'NomFabricanteInversor',
+                'CodGeracaoDistribuida', 'SigUFPrincipal', 'NomEmpreendimento'
+            ]
+            colunas_presentes = [c for c in colunas_uteis if c in df_temp.columns]
+            all_records.append(df_temp[colunas_presentes])
+            
+            offset += limit
+            placeholder.text(f"Baixando {label}: {offset} registros carregados...")
+            
+            if len(records) < limit:
+                break
+        except Exception as e:
+            st.error(f"Erro na conexão: {e}")
+            break
+            
+    placeholder.empty()
+    return pd.concat(all_records, ignore_index=True) if all_records else pd.DataFrame()
+
+# --- INTERFACE ---
+st.title("⚡ ANEEL Data Master - Download de Base Completa")
+st.markdown("Selecione os estados para consolidar a base de Geração Distribuída com os dados técnicos de fabricantes.")
+
+ufs_escolhidas = st.sidebar.multiselect(
+    "Estados para baixar", 
+    ["AC","AL","AM","AP","BA","CE","DF","ES","GO","MA","MG","MS","MT","PA","PB","PE","PI","PR","RJ","RN","RO","RR","RS","SC","SE","SP","TO"],
+    default=["SP"]
+)
+
+if st.sidebar.button("Gerar Base Consolidada", type="primary"):
+    if not ufs_escolhidas:
+        st.warning("Selecione ao menos uma UF.")
+    else:
+        # 1. Baixar Dados Técnicos (Base Nacional de Equipamentos)
+        with st.spinner("Buscando Catálogo Nacional de Equipamentos (esta é a parte mais pesada)..."):
+            df_tech = baixar_dados_aneel(RECURSOS["gd_tech"], label="Equipamentos")
+            
+        # 2. Baixar Dados de GD por Estado
+        lista_gd = []
+        for uf in ufs_escolhidas:
+            with st.spinner(f"Buscando usinas de {uf}..."):
+                df_uf = baixar_dados_aneel(RECURSOS["gd_info"], {"SigUF": uf}, label=f"GD {uf}")
+                lista_gd.append(df_uf)
+        
+        df_base_gd = pd.concat(lista_gd, ignore_index=True)
+        
+        # 3. Cruzamento de Dados (Merge)
+        if not df_base_gd.empty and not df_tech.empty:
+            st.info("Cruzando informações de usinas com fabricantes de módulos e inversores...")
+            
+            # Removemos duplicatas da tech para não inflar a base no merge
+            df_tech = df_tech.drop_duplicates(subset=['CodGeracaoDistribuida'])
+            
+            df_final = df_base_gd.merge(
+                df_tech[['CodGeracaoDistribuida', 'NomFabricanteModulo', 'NomFabricanteInversor']],
+                left_on='CodEmpreendimento',
+                right_on='CodGeracaoDistribuida',
+                how='left'
+            )
+            
+            st.success(f"Base gerada com sucesso! Total de {len(df_final)} registros.")
+            
+            # Exibição
+            st.subheader("Prévia dos Dados")
+            st.dataframe(df_final.head(50))
+            
+            # Exportação
+            csv_data = df_final.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Baixar Base Consolidada (CSV)",
+                data=csv_data,
+                file_name=f"base_aneel_{'_'.join(ufs_escolhidas)}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.error("Não foi possível cruzar os dados. Verifique a conexão com a ANEEL.")        try:
             r = session.get(BASE_URL, params=params, timeout=30)
             data = r.json()
             if not data["success"]: break
