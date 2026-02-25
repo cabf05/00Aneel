@@ -27,10 +27,6 @@ ESTADOS_BR = sorted([
     "RJ","RN","RO","RR","RS","SC","SE","SP","TO"
 ])
 
-# =====================================================
-# SESSAO HTTP
-# =====================================================
-
 def make_session():
     session = requests.Session()
     retry = Retry(
@@ -44,7 +40,7 @@ def make_session():
     session.mount("http://", adapter)
     return session
 
-def fetch_all_pages(resource_id, filters=None, limit_per_page=1000):
+def fetch_all_pages(resource_id, filters=None, limit_per_page=5000, progress_bar=None):
     session = make_session()
     offset = 0
     total = None
@@ -60,7 +56,7 @@ def fetch_all_pages(resource_id, filters=None, limit_per_page=1000):
             params["filters"] = json.dumps(filters)
 
         try:
-            response = session.get(BASE_URL, params=params, timeout=60)
+            response = session.get(BASE_URL, params=params, timeout=120)
             data = response.json()
 
             if not data.get("success", False):
@@ -78,10 +74,16 @@ def fetch_all_pages(resource_id, filters=None, limit_per_page=1000):
             all_records.extend(records)
             offset += limit_per_page
 
+            if progress_bar is not None and total > 0:
+                progress_bar.progress(
+                    min(offset / total, 1.0),
+                    text=str(min(offset, total)) + " / " + str(total) + " registros"
+                )
+
             if offset >= total:
                 break
 
-            time.sleep(0.1)
+            time.sleep(0.05)
 
         except Exception as e:
             print("Erro offset=" + str(offset) + ": " + str(e))
@@ -92,36 +94,21 @@ def fetch_all_pages(resource_id, filters=None, limit_per_page=1000):
 def fetch_uf(resource_id, uf_column, uf):
     return fetch_all_pages(resource_id, filters={uf_column: uf})
 
-# =====================================================
-# DOWNLOAD BRUTO (sem transformacoes, dados crus da API)
-# =====================================================
-
-def baixar_base_bruta(ufs, recurso_nome, resource_id, uf_column):
-    """
-    Baixa dados brutos de um recurso para as UFs escolhidas.
-    Retorna DataFrame cru sem nenhuma transformacao.
-    """
+def baixar_base_bruta(ufs, resource_id, uf_column):
     todas = set(ufs) >= set(ESTADOS_BR)
-
-    if todas:
+    if todas or uf_column is None:
         return fetch_all_pages(resource_id)
 
     max_workers = min(len(ufs), 6)
     parts = []
-
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(fetch_uf, resource_id, uf_column, uf): uf for uf in ufs}
         for fut in as_completed(futures):
             try:
                 parts.append(fut.result())
             except Exception as e:
-                print("Erro " + recurso_nome + ": " + str(e))
-
+                print("Erro download UF: " + str(e))
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-
-# =====================================================
-# CARREGAMENTO E TRANSFORMACAO PARA ANALISE
-# =====================================================
 
 @st.cache_data(show_spinner=False)
 def carregar_raw(ufs_tuple):
@@ -195,7 +182,6 @@ def carregar_dados_unificados(ufs_tuple):
         if not df_gd_tech.empty:
             df_gd["CodEmpreendimento"] = df_gd["CodEmpreendimento"].astype(str).str.strip()
             df_gd_tech["CodGeracaoDistribuida"] = df_gd_tech["CodGeracaoDistribuida"].astype(str).str.strip()
-
             cols_foto = [c for c in ["CodGeracaoDistribuida", "NomFabricanteModulo", "NomFabricanteInversor"] if c in df_gd_tech.columns]
             if len(cols_foto) > 1:
                 df_gd = df_gd.merge(
@@ -204,7 +190,6 @@ def carregar_dados_unificados(ufs_tuple):
                     right_on="CodGeracaoDistribuida",
                     how="left"
                 )
-
         df_gd["Potencia MW"] = pd.to_numeric(
             df_gd.get("MdaPotenciaInstaladaKW", pd.Series(dtype=str))
                 .astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False),
@@ -243,19 +228,11 @@ def carregar_dados_unificados(ufs_tuple):
 
 @st.cache_data(show_spinner=False)
 def transformar_csv_carregado(df_raw):
-    """
-    Aplica as mesmas transformacoes do pipeline normal em um CSV ja baixado.
-    Detecta automaticamente se e um CSV bruto da API ou um CSV ja processado.
-    """
-    # Se ja tem as colunas padrao, e um CSV ja processado - usa direto
     cols_padrao = ["Codigo", "Nome", "Categoria", "UF", "Fonte", "Potencia MW", "Lat", "Lon"]
     if all(c in df_raw.columns for c in cols_padrao):
         return df_raw.dropna(subset=["Lat", "Lon"]).reset_index(drop=True)
 
-    # Caso contrario, tenta aplicar transformacoes basicas
     df = df_raw.copy()
-
-    # Detecta se e usina ou GD pela presenca de colunas chave
     e_usina = "CodCEG" in df.columns
     e_gd    = "CodEmpreendimento" in df.columns and "CodCEG" not in df.columns
 
@@ -271,7 +248,6 @@ def transformar_csv_carregado(df_raw):
             df = df[df["DscFaseUsina"] == "Opera\u00e7\u00e3o"]
         df = df.rename(columns={"CodCEG": "Codigo", "NomEmpreendimento": "Nome", "SigUFPrincipal": "UF", "DscOrigemCombustivel": "Fonte"})
         df["Categoria"] = "Usina (Geracao Centralizada)"
-
     elif e_gd:
         df["Potencia MW"] = pd.to_numeric(
             df.get("MdaPotenciaInstaladaKW", pd.Series(dtype=str))
@@ -289,7 +265,6 @@ def transformar_csv_carregado(df_raw):
 
     cols_finais = cols_padrao + ["NomFabricanteModulo", "NomFabricanteInversor"]
     cols_presentes = [c for c in cols_finais if c in df.columns]
-
     return df[cols_presentes].dropna(subset=["Lat", "Lon"]).reset_index(drop=True)
 
 # =====================================================
@@ -311,8 +286,8 @@ modo_uso = st.sidebar.radio(
 if modo_uso == "Baixar Base Bruta":
     st.subheader("Download de Base Bruta da ANEEL")
     st.info(
-        "Baixe os dados brutos diretamente da API da ANEEL no formato CSV. "
-        "Depois use a opcao 'Carregar CSV Local' para analisar sem precisar consultar a API novamente."
+        "Baixe os dados brutos da API no formato CSV. "
+        "Depois use 'Carregar CSV Local' para analisar sem consultar a API novamente."
     )
 
     col_a, col_b = st.columns(2)
@@ -320,7 +295,11 @@ if modo_uso == "Baixar Base Bruta":
     with col_a:
         recurso_dl = st.selectbox(
             "Qual base deseja baixar?",
-            options=["Usinas (Geracao Centralizada)", "GD Info (Geracao Distribuida)", "GD Foto (Dados Tecnicos)"],
+            options=[
+                "Usinas (Geracao Centralizada)",
+                "GD Info (Geracao Distribuida)",
+                "GD Foto (Dados Tecnicos)"
+            ]
         )
 
     with col_b:
@@ -336,26 +315,27 @@ if modo_uso == "Baixar Base Bruta":
         "GD Foto (Dados Tecnicos)":      (RES_GD_FOTO, None,           "gd_foto"),
     }
 
+    st.caption("Dica: GD Foto nao tem filtro por UF, sera baixado completo independente da selecao.")
+
     if st.button("Iniciar Download", type="primary", use_container_width=True):
         resource_id, uf_col, nome_arquivo = mapa_recursos[recurso_dl]
 
-        # GD Foto nao tem filtro por UF
-        ufs_efetivas = ufs_dl if uf_col else ESTADOS_BR
+        st.write("Baixando " + recurso_dl + "...")
 
-        with st.spinner("Baixando " + recurso_dl + "... Isso pode demorar varios minutos para bases grandes."):
-            if uf_col is None:
-                df_bruto = fetch_all_pages(resource_id)
-            else:
-                df_bruto = baixar_base_bruta(ufs_efetivas, nome_arquivo, resource_id, uf_col)
+        if uf_col is None or set(ufs_dl) >= set(ESTADOS_BR):
+            bar = st.progress(0, text="Iniciando...")
+            df_bruto = fetch_all_pages(resource_id, progress_bar=bar)
+            bar.empty()
+        else:
+            with st.spinner("Baixando " + str(len(ufs_dl)) + " estado(s) em paralelo..."):
+                df_bruto = baixar_base_bruta(ufs_dl, resource_id, uf_col)
 
         if df_bruto.empty:
             st.error("Nenhum dado retornado. Verifique a conexao e tente novamente.")
         else:
-            st.success(str(len(df_bruto)) + " registros baixados com sucesso!")
-
+            st.success(str(len(df_bruto)) + " registros baixados!")
             ufs_str = "todos" if selecionar_todos_dl else "-".join(sorted(ufs_dl))
             nome_csv = nome_arquivo + "_" + ufs_str + ".csv"
-
             csv_bytes = df_bruto.to_csv(index=False).encode("utf-8")
             st.download_button(
                 label="Clique aqui para salvar o CSV",
@@ -364,7 +344,11 @@ if modo_uso == "Baixar Base Bruta":
                 mime="text/csv",
                 use_container_width=True
             )
-            st.caption("Arquivo: " + nome_csv + " | " + str(len(df_bruto.columns)) + " colunas | " + str(len(df_bruto)) + " linhas")
+            st.caption(
+                nome_csv + " | " +
+                str(len(df_bruto.columns)) + " colunas | " +
+                str(len(df_bruto)) + " linhas"
+            )
 
     st.stop()
 
@@ -375,15 +359,11 @@ if modo_uso == "Baixar Base Bruta":
 elif modo_uso == "Carregar CSV Local":
     st.subheader("Carregar CSV para Analise")
     st.info(
-        "Faca o upload de um CSV baixado anteriormente (processado ou bruto da API). "
-        "O sistema detecta o formato automaticamente."
+        "Faca o upload de um CSV baixado anteriormente. "
+        "O sistema detecta automaticamente se e um CSV bruto ou ja processado."
     )
 
-    arquivo = st.file_uploader(
-        "Selecione o arquivo CSV",
-        type=["csv"],
-        help="Aceita tanto o CSV 'Dados Filtrados' exportado pelo dashboard quanto os CSVs brutos baixados no modo Download."
-    )
+    arquivo = st.file_uploader("Selecione o arquivo CSV", type=["csv"])
 
     if arquivo is None:
         st.warning("Nenhum arquivo carregado. Faca o upload de um CSV para continuar.")
@@ -402,6 +382,7 @@ elif modo_uso == "Carregar CSV Local":
         st.stop()
 
     st.success(str(len(df)) + " registros carregados do arquivo.")
+    ufs_escolhidas_para_zoom = df["UF"].dropna().unique().tolist()
 
 # =====================================================
 # MODO 3: CONSULTAR API
@@ -420,7 +401,6 @@ else:
             "Estados (UF)",
             options=ESTADOS_BR,
             default=["SP", "RJ"],
-            help="Selecione um ou mais estados."
         )
 
     if not ufs_escolhidas:
@@ -455,11 +435,10 @@ else:
         st.stop()
 
     st.sidebar.success(str(len(df)) + " instalacoes carregadas.")
-
     ufs_escolhidas_para_zoom = ufs_escolhidas
 
 # =====================================================
-# A PARTIR DAQUI: DASHBOARD COMUM PARA MODOS 2 E 3
+# DASHBOARD - COMUM PARA MODOS 2 E 3
 # =====================================================
 
 st.sidebar.markdown("---")
@@ -498,11 +477,9 @@ map_data = df_filtrado.copy()
 center_lat = map_data["Lat"].mean() if not map_data.empty else -14.2350
 center_lon = map_data["Lon"].mean() if not map_data.empty else -51.9253
 
-ufs_zoom = ufs_escolhidas_para_zoom if modo_uso == "Consultar API (online)" else df_filtrado["UF"].dropna().unique().tolist()
-
-if len(ufs_zoom) == 1:
+if len(ufs_escolhidas_para_zoom) == 1:
     zoom_level = 6
-elif len(ufs_zoom) <= 5:
+elif len(ufs_escolhidas_para_zoom) <= 5:
     zoom_level = 5
 else:
     zoom_level = 4
@@ -561,3 +538,4 @@ st.download_button(
     "dados_energia_brasil.csv",
     "text/csv"
 )
+
