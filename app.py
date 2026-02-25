@@ -12,7 +12,7 @@ from st_aggrid.shared import GridUpdateMode
 from urllib3.util.retry import Retry
 
 st.set_page_config(layout="wide", page_title="Brazil Energy Intelligence")
-st.title("⚡ Brazil Energy Intelligence Dashboard - Usinas & GD")
+st.title("Brazil Energy Intelligence Dashboard - Usinas & GD")
 
 BASE_URL = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search"
 RES_USINAS  = "11ec447d-698d-4ab8-977f-b424d5deee6a"
@@ -40,17 +40,17 @@ def make_session():
     session.mount("http://", adapter)
     return session
 
-def fetch_all_pages(resource_id, filters=None, limit_per_page=1000, max_records=10000):
+def fetch_all_pages(resource_id, filters=None, limit_per_page=1000):
     """
-    IMPORTANTE: max_records define um teto de segurança. 
-    Sem isso, consultar estados muito grandes fará o app travar para sempre.
+    Busca TODOS os registros usando o campo 'total' da API como criterio de parada.
+    Sem limite artificial - garante que todos os dados sejam retornados.
     """
     session = make_session()
     offset = 0
     total = None
     all_records = []
 
-    while offset < max_records:
+    while True:
         params = {
             "resource_id": resource_id,
             "limit": limit_per_page,
@@ -67,9 +67,10 @@ def fetch_all_pages(resource_id, filters=None, limit_per_page=1000, max_records=
                 break
 
             result = data["result"]
-            
+
             if total is None:
                 total = result.get("total", 0)
+                print("Recurso " + resource_id[-8:] + " | filtro=" + str(filters) + " | total=" + str(total))
 
             records = result.get("records", [])
             if not records:
@@ -84,7 +85,7 @@ def fetch_all_pages(resource_id, filters=None, limit_per_page=1000, max_records=
             time.sleep(0.1)
 
         except Exception as e:
-            print(f"Erro offset={offset}: {e}")
+            print("Erro offset=" + str(offset) + ": " + str(e))
             break
 
     return pd.DataFrame(all_records)
@@ -97,21 +98,22 @@ def carregar_raw(ufs_tuple):
     ufs = list(ufs_tuple)
     todas = set(ufs) >= set(ESTADOS_BR)
 
-    # Se escolher todos, baixa sem filtro de estado (respeitando o limite global máximo)
     if todas:
         with ThreadPoolExecutor(max_workers=3) as ex:
-            f_us   = ex.submit(fetch_all_pages, RES_USINAS, max_records=20000)
-            f_gd   = ex.submit(fetch_all_pages, RES_GD_INFO, max_records=20000)
-            f_foto = ex.submit(fetch_all_pages, RES_GD_FOTO, max_records=20000)
+            f_us   = ex.submit(fetch_all_pages, RES_USINAS)
+            f_gd   = ex.submit(fetch_all_pages, RES_GD_INFO)
+            f_foto = ex.submit(fetch_all_pages, RES_GD_FOTO)
         return f_us.result(), f_gd.result(), f_foto.result()
 
-    # Ajuste de limite para não derrubar a ANEEL (Máximo de 4 workers)
-    max_workers = min(len(ufs), 4)
+    # Modo por UF: busca usinas e gd_info filtrados por estado
+    # GD Foto nao tem coluna UF - busca tudo e o merge filtra naturalmente
+    max_workers = min(len(ufs) * 2 + 1, 8)
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         fut_usinas  = {ex.submit(fetch_uf, RES_USINAS,  UF_COL_USINAS,  uf): uf for uf in ufs}
         fut_gd_info = {ex.submit(fetch_uf, RES_GD_INFO, UF_COL_GD_INFO, uf): uf for uf in ufs}
-        fut_foto    = ex.submit(fetch_all_pages, RES_GD_FOTO, max_records=20000) # GD Técnico não tem como filtrar por UF facilmente na raiz
+        # GD Foto sempre completo para o merge nao perder registros
+        fut_foto = ex.submit(fetch_all_pages, RES_GD_FOTO)
 
         parts_usinas = []
         for fut in as_completed(fut_usinas):
@@ -153,24 +155,34 @@ def carregar_dados_unificados(ufs_tuple):
                 .astype(str).str.replace(",", "."), errors="coerce"
         )
         if "DscFaseUsina" in df_usinas.columns:
-            df_usinas = df_usinas[df_usinas["DscFaseUsina"] == "Operação"]
-            
+            df_usinas = df_usinas[df_usinas["DscFaseUsina"] == "Opera\u00e7\u00e3o"]
         df_usinas = df_usinas.rename(columns={
             "CodCEG":               "Codigo",
             "NomEmpreendimento":    "Nome",
             "SigUFPrincipal":       "UF",
             "DscOrigemCombustivel": "Fonte",
         })
-        df_usinas["Categoria"] = "Usina (Geração Centralizada)"
+        df_usinas["Categoria"] = "Usina (Geracao Centralizada)"
 
     if not df_gd.empty:
+        # Merge com GD Foto para trazer dados tecnicos dos equipamentos
         if not df_gd_tech.empty:
-            df_gd = df_gd.merge(
-                df_gd_tech[["CodGeracaoDistribuida", "NomFabricanteModulo", "NomFabricanteInversor"]],
-                left_on="CodEmpreendimento",
-                right_on="CodGeracaoDistribuida",
-                how="left"
-            )
+            # Garante que a chave de join esta como string nos dois lados
+            df_gd["CodEmpreendimento"] = df_gd["CodEmpreendimento"].astype(str).str.strip()
+            df_gd_tech["CodGeracaoDistribuida"] = df_gd_tech["CodGeracaoDistribuida"].astype(str).str.strip()
+
+            cols_foto = ["CodGeracaoDistribuida", "NomFabricanteModulo", "NomFabricanteInversor"]
+            # Filtra apenas colunas que existem na tabela de foto
+            cols_foto = [c for c in cols_foto if c in df_gd_tech.columns]
+
+            if len(cols_foto) > 1:
+                df_gd = df_gd.merge(
+                    df_gd_tech[cols_foto],
+                    left_on="CodEmpreendimento",
+                    right_on="CodGeracaoDistribuida",
+                    how="left"
+                )
+
         df_gd["Potencia MW"] = pd.to_numeric(
             df_gd.get("MdaPotenciaInstaladaKW", pd.Series(dtype=str))
                 .astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False),
@@ -190,11 +202,10 @@ def carregar_dados_unificados(ufs_tuple):
             "SigUF":                    "UF",
             "DscFonteGeracao":          "Fonte",
         })
-        df_gd["Categoria"] = "Geração Distribuída"
+        df_gd["Categoria"] = "Geracao Distribuida"
 
     cols_padrao = ["Codigo", "Nome", "Categoria", "UF", "Fonte", "Potencia MW", "Lat", "Lon"]
 
-    # Garantir colunas se não existirem
     for col in ["NomFabricanteModulo", "NomFabricanteInversor"]:
         if col not in df_gd.columns:
             df_gd[col] = "-"
@@ -209,10 +220,10 @@ def carregar_dados_unificados(ufs_tuple):
     return df_final.dropna(subset=["Lat", "Lon"]).reset_index(drop=True)
 
 # =====================================================
-# SIDEBAR FILTROS UNIFICADOS
+# UI - SELECAO DE ESTADOS
 # =====================================================
 
-st.sidebar.header("Seleção de Estados")
+st.sidebar.header("Selecao de Estados")
 
 selecionar_todos = st.sidebar.checkbox("Selecionar todos os estados", value=False)
 
@@ -233,7 +244,6 @@ if not ufs_escolhidas:
 
 carregar = st.sidebar.button("Carregar / Atualizar Dados", type="primary", use_container_width=True)
 
-# Lógica de Controle do Botão
 chave_cache = tuple(sorted(ufs_escolhidas))
 
 if "chave_atual" not in st.session_state or st.session_state["chave_atual"] != chave_cache:
@@ -242,10 +252,9 @@ if "chave_atual" not in st.session_state or st.session_state["chave_atual"] != c
             estados_str = ", ".join(ufs_escolhidas)
         else:
             estados_str = str(len(ufs_escolhidas)) + " estados"
-        st.info("Estados selecionados: " + estados_str + ". Clique no botão 'Carregar / Atualizar Dados' para iniciar a busca.")
+        st.info("Estados selecionados: " + estados_str + ". Clique em Carregar / Atualizar Dados.")
         st.stop()
 
-# Atualiza a chave atual após o clique do botão
 st.session_state["chave_atual"] = chave_cache
 
 if len(ufs_escolhidas) <= 5:
@@ -253,21 +262,25 @@ if len(ufs_escolhidas) <= 5:
 else:
     modo = str(len(ufs_escolhidas)) + " estados"
 
-# =====================================================
-# CARREGAMENTO E MÉTRICAS
-# =====================================================
+# Aviso para selecao grande
+if selecionar_todos:
+    st.warning("Modo completo selecionado. A carga inicial pode levar varios minutos. O cache evita repeticao nas proximas visitas.")
 
-with st.spinner("Buscando dados para " + modo + "... Isso pode levar alguns segundos."):
+with st.spinner("Buscando dados para " + modo + "... Aguarde."):
     df = carregar_dados_unificados(chave_cache)
 
 if df.empty:
-    st.error("Nenhum dado retornado da ANEEL. Tente novamente mais tarde ou verifique os filtros.")
+    st.error("Nenhum dado retornado. Tente novamente ou selecione outros estados.")
     st.stop()
 
-st.sidebar.success(str(len(df)) + " instalações carregadas.")
+st.sidebar.success(str(len(df)) + " instalacoes carregadas.")
 st.sidebar.markdown("---")
 
-st.sidebar.header("Filtros Secundários")
+# =====================================================
+# FILTROS SECUNDARIOS
+# =====================================================
+
+st.sidebar.header("Filtros")
 
 categorias = st.sidebar.multiselect(
     "Categoria",
@@ -290,18 +303,18 @@ df_filtrado = df_filtrado[
 ]
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Total de Instalações",  str(len(df_filtrado)))
+col1.metric("Total de Instalacoes",  str(len(df_filtrado)))
 col2.metric("Capacidade Total (MW)", str(round(df_filtrado["Potencia MW"].sum(), 2)))
-col3.metric("Estados Renderizados",  str(df_filtrado["UF"].nunique()))
-col4.metric("Fontes Distintas",      str(df_filtrado["Fonte"].nunique()))
+col3.metric("Estados",               str(df_filtrado["UF"].nunique()))
+col4.metric("Fontes distintas",      str(df_filtrado["Fonte"].nunique()))
 
 st.markdown("---")
 
 # =====================================================
-# VISÃO GEOESPACIAL
+# MAPA
 # =====================================================
 
-st.subheader("Visão Geoespacial")
+st.subheader("Visao Geoespacial")
 
 map_data = df_filtrado.copy()
 center_lat = map_data["Lat"].mean() if not map_data.empty else -14.2350
@@ -321,7 +334,7 @@ if len(map_data) > 3000:
         "HexagonLayer", data=map_data, get_position="[Lon, Lat]",
         radius=30000, elevation_scale=50, pickable=True, extruded=True,
     )
-    tooltip_html = {"html": "<b>Agrupamento Geoespacial</b><br/>Instalações neste polígono: <b>{elevationValue}</b>"}
+    tooltip_html = {"html": "<b>Agrupamento</b><br/>Instalacoes na area: <b>{elevationValue}</b>"}
 else:
     layer = pdk.Layer(
         "ScatterplotLayer", data=map_data, get_position="[Lon, Lat]",
@@ -342,7 +355,7 @@ st.pydeck_chart(pdk.Deck(
 st.markdown("---")
 
 # =====================================================
-# AGGRID E DOWNLOAD
+# TABELA E DOWNLOAD
 # =====================================================
 
 st.subheader("Base de Dados Completa")
