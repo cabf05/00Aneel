@@ -27,6 +27,10 @@ ESTADOS_BR = sorted([
     "RJ","RN","RO","RR","RS","SC","SE","SP","TO"
 ])
 
+# =====================================================
+# SESSAO HTTP
+# =====================================================
+
 def make_session():
     session = requests.Session()
     retry = Retry(
@@ -41,10 +45,6 @@ def make_session():
     return session
 
 def fetch_all_pages(resource_id, filters=None, limit_per_page=1000):
-    """
-    Busca TODOS os registros usando o campo 'total' da API como criterio de parada.
-    Sem limite artificial - garante que todos os dados sejam retornados.
-    """
     session = make_session()
     offset = 0
     total = None
@@ -70,7 +70,6 @@ def fetch_all_pages(resource_id, filters=None, limit_per_page=1000):
 
             if total is None:
                 total = result.get("total", 0)
-                print("Recurso " + resource_id[-8:] + " | filtro=" + str(filters) + " | total=" + str(total))
 
             records = result.get("records", [])
             if not records:
@@ -93,6 +92,37 @@ def fetch_all_pages(resource_id, filters=None, limit_per_page=1000):
 def fetch_uf(resource_id, uf_column, uf):
     return fetch_all_pages(resource_id, filters={uf_column: uf})
 
+# =====================================================
+# DOWNLOAD BRUTO (sem transformacoes, dados crus da API)
+# =====================================================
+
+def baixar_base_bruta(ufs, recurso_nome, resource_id, uf_column):
+    """
+    Baixa dados brutos de um recurso para as UFs escolhidas.
+    Retorna DataFrame cru sem nenhuma transformacao.
+    """
+    todas = set(ufs) >= set(ESTADOS_BR)
+
+    if todas:
+        return fetch_all_pages(resource_id)
+
+    max_workers = min(len(ufs), 6)
+    parts = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(fetch_uf, resource_id, uf_column, uf): uf for uf in ufs}
+        for fut in as_completed(futures):
+            try:
+                parts.append(fut.result())
+            except Exception as e:
+                print("Erro " + recurso_nome + ": " + str(e))
+
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+# =====================================================
+# CARREGAMENTO E TRANSFORMACAO PARA ANALISE
+# =====================================================
+
 @st.cache_data(show_spinner=False)
 def carregar_raw(ufs_tuple):
     ufs = list(ufs_tuple)
@@ -105,15 +135,12 @@ def carregar_raw(ufs_tuple):
             f_foto = ex.submit(fetch_all_pages, RES_GD_FOTO)
         return f_us.result(), f_gd.result(), f_foto.result()
 
-    # Modo por UF: busca usinas e gd_info filtrados por estado
-    # GD Foto nao tem coluna UF - busca tudo e o merge filtra naturalmente
     max_workers = min(len(ufs) * 2 + 1, 8)
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         fut_usinas  = {ex.submit(fetch_uf, RES_USINAS,  UF_COL_USINAS,  uf): uf for uf in ufs}
         fut_gd_info = {ex.submit(fetch_uf, RES_GD_INFO, UF_COL_GD_INFO, uf): uf for uf in ufs}
-        # GD Foto sempre completo para o merge nao perder registros
-        fut_foto = ex.submit(fetch_all_pages, RES_GD_FOTO)
+        fut_foto    = ex.submit(fetch_all_pages, RES_GD_FOTO)
 
         parts_usinas = []
         for fut in as_completed(fut_usinas):
@@ -165,16 +192,11 @@ def carregar_dados_unificados(ufs_tuple):
         df_usinas["Categoria"] = "Usina (Geracao Centralizada)"
 
     if not df_gd.empty:
-        # Merge com GD Foto para trazer dados tecnicos dos equipamentos
         if not df_gd_tech.empty:
-            # Garante que a chave de join esta como string nos dois lados
             df_gd["CodEmpreendimento"] = df_gd["CodEmpreendimento"].astype(str).str.strip()
             df_gd_tech["CodGeracaoDistribuida"] = df_gd_tech["CodGeracaoDistribuida"].astype(str).str.strip()
 
-            cols_foto = ["CodGeracaoDistribuida", "NomFabricanteModulo", "NomFabricanteInversor"]
-            # Filtra apenas colunas que existem na tabela de foto
-            cols_foto = [c for c in cols_foto if c in df_gd_tech.columns]
-
+            cols_foto = [c for c in ["CodGeracaoDistribuida", "NomFabricanteModulo", "NomFabricanteInversor"] if c in df_gd_tech.columns]
             if len(cols_foto) > 1:
                 df_gd = df_gd.merge(
                     df_gd_tech[cols_foto],
@@ -219,67 +241,228 @@ def carregar_dados_unificados(ufs_tuple):
 
     return df_final.dropna(subset=["Lat", "Lon"]).reset_index(drop=True)
 
+@st.cache_data(show_spinner=False)
+def transformar_csv_carregado(df_raw):
+    """
+    Aplica as mesmas transformacoes do pipeline normal em um CSV ja baixado.
+    Detecta automaticamente se e um CSV bruto da API ou um CSV ja processado.
+    """
+    # Se ja tem as colunas padrao, e um CSV ja processado - usa direto
+    cols_padrao = ["Codigo", "Nome", "Categoria", "UF", "Fonte", "Potencia MW", "Lat", "Lon"]
+    if all(c in df_raw.columns for c in cols_padrao):
+        return df_raw.dropna(subset=["Lat", "Lon"]).reset_index(drop=True)
+
+    # Caso contrario, tenta aplicar transformacoes basicas
+    df = df_raw.copy()
+
+    # Detecta se e usina ou GD pela presenca de colunas chave
+    e_usina = "CodCEG" in df.columns
+    e_gd    = "CodEmpreendimento" in df.columns and "CodCEG" not in df.columns
+
+    if e_usina:
+        df["Potencia MW"] = pd.to_numeric(
+            df.get("MdaPotenciaOutorgadaKw", pd.Series(dtype=str))
+                .astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False),
+            errors="coerce"
+        ) / 1000
+        df["Lat"] = pd.to_numeric(df.get("NumCoordNEmpreendimento", pd.Series(dtype=str)).astype(str).str.replace(",", "."), errors="coerce")
+        df["Lon"] = pd.to_numeric(df.get("NumCoordEEmpreendimento", pd.Series(dtype=str)).astype(str).str.replace(",", "."), errors="coerce")
+        if "DscFaseUsina" in df.columns:
+            df = df[df["DscFaseUsina"] == "Opera\u00e7\u00e3o"]
+        df = df.rename(columns={"CodCEG": "Codigo", "NomEmpreendimento": "Nome", "SigUFPrincipal": "UF", "DscOrigemCombustivel": "Fonte"})
+        df["Categoria"] = "Usina (Geracao Centralizada)"
+
+    elif e_gd:
+        df["Potencia MW"] = pd.to_numeric(
+            df.get("MdaPotenciaInstaladaKW", pd.Series(dtype=str))
+                .astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False),
+            errors="coerce"
+        ) / 1000
+        df["Lat"] = pd.to_numeric(df.get("NumCoordNEmpreendimento", pd.Series(dtype=str)).astype(str).str.replace(",", "."), errors="coerce")
+        df["Lon"] = pd.to_numeric(df.get("NumCoordEEmpreendimento", pd.Series(dtype=str)).astype(str).str.replace(",", "."), errors="coerce")
+        df = df.rename(columns={"CodEmpreendimento": "Codigo", "NomTitularEmpreendimento": "Nome", "SigUF": "UF", "DscFonteGeracao": "Fonte"})
+        df["Categoria"] = "Geracao Distribuida"
+
+    for col in ["NomFabricanteModulo", "NomFabricanteInversor"]:
+        if col not in df.columns:
+            df[col] = "-"
+
+    cols_finais = cols_padrao + ["NomFabricanteModulo", "NomFabricanteInversor"]
+    cols_presentes = [c for c in cols_finais if c in df.columns]
+
+    return df[cols_presentes].dropna(subset=["Lat", "Lon"]).reset_index(drop=True)
+
 # =====================================================
-# UI - SELECAO DE ESTADOS
+# SELECAO DO MODO DE USO
 # =====================================================
 
-st.sidebar.header("Selecao de Estados")
+st.sidebar.header("Modo de Uso")
 
-selecionar_todos = st.sidebar.checkbox("Selecionar todos os estados", value=False)
+modo_uso = st.sidebar.radio(
+    "Como deseja usar o sistema?",
+    options=["Consultar API (online)", "Baixar Base Bruta", "Carregar CSV Local"],
+    index=0
+)
 
-if selecionar_todos:
-    ufs_escolhidas = ESTADOS_BR
-    st.sidebar.caption("Todos os " + str(len(ESTADOS_BR)) + " estados selecionados.")
-else:
-    ufs_escolhidas = st.sidebar.multiselect(
-        "Estados (UF)",
-        options=ESTADOS_BR,
-        default=["SP", "RJ"],
-        help="Selecione um ou mais estados."
+# =====================================================
+# MODO 1: DOWNLOAD DE BASE BRUTA
+# =====================================================
+
+if modo_uso == "Baixar Base Bruta":
+    st.subheader("Download de Base Bruta da ANEEL")
+    st.info(
+        "Baixe os dados brutos diretamente da API da ANEEL no formato CSV. "
+        "Depois use a opcao 'Carregar CSV Local' para analisar sem precisar consultar a API novamente."
     )
 
-if not ufs_escolhidas:
-    st.warning("Selecione ao menos um estado na barra lateral.")
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        recurso_dl = st.selectbox(
+            "Qual base deseja baixar?",
+            options=["Usinas (Geracao Centralizada)", "GD Info (Geracao Distribuida)", "GD Foto (Dados Tecnicos)"],
+        )
+
+    with col_b:
+        selecionar_todos_dl = st.checkbox("Todos os estados", value=True)
+        if not selecionar_todos_dl:
+            ufs_dl = st.multiselect("Estados", options=ESTADOS_BR, default=["SP"])
+        else:
+            ufs_dl = ESTADOS_BR
+
+    mapa_recursos = {
+        "Usinas (Geracao Centralizada)": (RES_USINAS,  UF_COL_USINAS,  "usinas"),
+        "GD Info (Geracao Distribuida)": (RES_GD_INFO, UF_COL_GD_INFO, "gd_info"),
+        "GD Foto (Dados Tecnicos)":      (RES_GD_FOTO, None,           "gd_foto"),
+    }
+
+    if st.button("Iniciar Download", type="primary", use_container_width=True):
+        resource_id, uf_col, nome_arquivo = mapa_recursos[recurso_dl]
+
+        # GD Foto nao tem filtro por UF
+        ufs_efetivas = ufs_dl if uf_col else ESTADOS_BR
+
+        with st.spinner("Baixando " + recurso_dl + "... Isso pode demorar varios minutos para bases grandes."):
+            if uf_col is None:
+                df_bruto = fetch_all_pages(resource_id)
+            else:
+                df_bruto = baixar_base_bruta(ufs_efetivas, nome_arquivo, resource_id, uf_col)
+
+        if df_bruto.empty:
+            st.error("Nenhum dado retornado. Verifique a conexao e tente novamente.")
+        else:
+            st.success(str(len(df_bruto)) + " registros baixados com sucesso!")
+
+            ufs_str = "todos" if selecionar_todos_dl else "-".join(sorted(ufs_dl))
+            nome_csv = nome_arquivo + "_" + ufs_str + ".csv"
+
+            csv_bytes = df_bruto.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="Clique aqui para salvar o CSV",
+                data=csv_bytes,
+                file_name=nome_csv,
+                mime="text/csv",
+                use_container_width=True
+            )
+            st.caption("Arquivo: " + nome_csv + " | " + str(len(df_bruto.columns)) + " colunas | " + str(len(df_bruto)) + " linhas")
+
     st.stop()
 
-carregar = st.sidebar.button("Carregar / Atualizar Dados", type="primary", use_container_width=True)
+# =====================================================
+# MODO 2: CARREGAR CSV LOCAL
+# =====================================================
 
-chave_cache = tuple(sorted(ufs_escolhidas))
+elif modo_uso == "Carregar CSV Local":
+    st.subheader("Carregar CSV para Analise")
+    st.info(
+        "Faca o upload de um CSV baixado anteriormente (processado ou bruto da API). "
+        "O sistema detecta o formato automaticamente."
+    )
 
-if "chave_atual" not in st.session_state or st.session_state["chave_atual"] != chave_cache:
-    if not carregar:
-        if len(ufs_escolhidas) <= 5:
-            estados_str = ", ".join(ufs_escolhidas)
-        else:
-            estados_str = str(len(ufs_escolhidas)) + " estados"
-        st.info("Estados selecionados: " + estados_str + ". Clique em Carregar / Atualizar Dados.")
+    arquivo = st.file_uploader(
+        "Selecione o arquivo CSV",
+        type=["csv"],
+        help="Aceita tanto o CSV 'Dados Filtrados' exportado pelo dashboard quanto os CSVs brutos baixados no modo Download."
+    )
+
+    if arquivo is None:
+        st.warning("Nenhum arquivo carregado. Faca o upload de um CSV para continuar.")
         st.stop()
 
-st.session_state["chave_atual"] = chave_cache
+    with st.spinner("Processando arquivo..."):
+        try:
+            df_raw = pd.read_csv(arquivo, low_memory=False)
+            df = transformar_csv_carregado(df_raw)
+        except Exception as e:
+            st.error("Erro ao ler o arquivo: " + str(e))
+            st.stop()
 
-if len(ufs_escolhidas) <= 5:
-    modo = ", ".join(ufs_escolhidas)
+    if df.empty:
+        st.error("O arquivo nao retornou dados validos apos o processamento.")
+        st.stop()
+
+    st.success(str(len(df)) + " registros carregados do arquivo.")
+
+# =====================================================
+# MODO 3: CONSULTAR API
+# =====================================================
+
 else:
-    modo = str(len(ufs_escolhidas)) + " estados"
+    st.sidebar.header("Selecao de Estados")
 
-# Aviso para selecao grande
-if selecionar_todos:
-    st.warning("Modo completo selecionado. A carga inicial pode levar varios minutos. O cache evita repeticao nas proximas visitas.")
+    selecionar_todos = st.sidebar.checkbox("Selecionar todos os estados", value=False)
 
-with st.spinner("Buscando dados para " + modo + "... Aguarde."):
-    df = carregar_dados_unificados(chave_cache)
+    if selecionar_todos:
+        ufs_escolhidas = ESTADOS_BR
+        st.sidebar.caption("Todos os " + str(len(ESTADOS_BR)) + " estados selecionados.")
+    else:
+        ufs_escolhidas = st.sidebar.multiselect(
+            "Estados (UF)",
+            options=ESTADOS_BR,
+            default=["SP", "RJ"],
+            help="Selecione um ou mais estados."
+        )
 
-if df.empty:
-    st.error("Nenhum dado retornado. Tente novamente ou selecione outros estados.")
-    st.stop()
+    if not ufs_escolhidas:
+        st.warning("Selecione ao menos um estado na barra lateral.")
+        st.stop()
 
-st.sidebar.success(str(len(df)) + " instalacoes carregadas.")
+    carregar = st.sidebar.button("Carregar / Atualizar Dados", type="primary", use_container_width=True)
+
+    chave_cache = tuple(sorted(ufs_escolhidas))
+
+    if "chave_atual" not in st.session_state or st.session_state["chave_atual"] != chave_cache:
+        if not carregar:
+            if len(ufs_escolhidas) <= 5:
+                estados_str = ", ".join(ufs_escolhidas)
+            else:
+                estados_str = str(len(ufs_escolhidas)) + " estados"
+            st.info("Estados selecionados: " + estados_str + ". Clique em Carregar / Atualizar Dados.")
+            st.stop()
+
+    st.session_state["chave_atual"] = chave_cache
+
+    if len(ufs_escolhidas) <= 5:
+        modo_label = ", ".join(ufs_escolhidas)
+    else:
+        modo_label = str(len(ufs_escolhidas)) + " estados"
+
+    with st.spinner("Buscando dados para " + modo_label + "..."):
+        df = carregar_dados_unificados(chave_cache)
+
+    if df.empty:
+        st.error("Nenhum dado retornado. Tente novamente ou selecione outros estados.")
+        st.stop()
+
+    st.sidebar.success(str(len(df)) + " instalacoes carregadas.")
+
+    ufs_escolhidas_para_zoom = ufs_escolhidas
+
+# =====================================================
+# A PARTIR DAQUI: DASHBOARD COMUM PARA MODOS 2 E 3
+# =====================================================
+
 st.sidebar.markdown("---")
-
-# =====================================================
-# FILTROS SECUNDARIOS
-# =====================================================
-
 st.sidebar.header("Filtros")
 
 categorias = st.sidebar.multiselect(
@@ -309,20 +492,17 @@ col3.metric("Estados",               str(df_filtrado["UF"].nunique()))
 col4.metric("Fontes distintas",      str(df_filtrado["Fonte"].nunique()))
 
 st.markdown("---")
-
-# =====================================================
-# MAPA
-# =====================================================
-
 st.subheader("Visao Geoespacial")
 
 map_data = df_filtrado.copy()
 center_lat = map_data["Lat"].mean() if not map_data.empty else -14.2350
 center_lon = map_data["Lon"].mean() if not map_data.empty else -51.9253
 
-if len(ufs_escolhidas) == 1:
+ufs_zoom = ufs_escolhidas_para_zoom if modo_uso == "Consultar API (online)" else df_filtrado["UF"].dropna().unique().tolist()
+
+if len(ufs_zoom) == 1:
     zoom_level = 6
-elif len(ufs_escolhidas) <= 5:
+elif len(ufs_zoom) <= 5:
     zoom_level = 5
 else:
     zoom_level = 4
@@ -353,11 +533,6 @@ st.pydeck_chart(pdk.Deck(
 ))
 
 st.markdown("---")
-
-# =====================================================
-# TABELA E DOWNLOAD
-# =====================================================
-
 st.subheader("Base de Dados Completa")
 
 df_exibicao = (
